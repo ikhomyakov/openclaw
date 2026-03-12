@@ -16,6 +16,7 @@ import {
   restoreMatrixRoomKeyBackup,
   verifyMatrixRecoveryKey,
 } from "./matrix/actions/verification.js";
+import { resolveMatrixRoomKeyBackupIssue } from "./matrix/backup-health.js";
 import { resolveMatrixAuthContext } from "./matrix/client.js";
 import { setMatrixSdkConsoleLogging, setMatrixSdkLogMode } from "./matrix/client/logging.js";
 import { resolveMatrixConfigPath, updateMatrixAccountConfig } from "./matrix/config-update.js";
@@ -400,22 +401,6 @@ function resolveBackupStatus(status: {
   };
 }
 
-type MatrixCliBackupIssueCode =
-  | "missing-server-backup"
-  | "key-load-failed"
-  | "key-not-loaded"
-  | "key-mismatch"
-  | "untrusted-signature"
-  | "inactive"
-  | "indeterminate"
-  | "ok";
-
-type MatrixCliBackupIssue = {
-  code: MatrixCliBackupIssueCode;
-  summary: string;
-  message: string | null;
-};
-
 function yesNoUnknown(value: boolean | null): string {
   if (value === true) {
     return "yes";
@@ -474,77 +459,8 @@ function printVerificationGuidance(status: MatrixCliVerificationStatus, accountI
   printGuidance(buildVerificationGuidance(status, accountId));
 }
 
-function resolveBackupIssue(backup: MatrixCliBackupStatus): MatrixCliBackupIssue {
-  if (!backup.serverVersion) {
-    return {
-      code: "missing-server-backup",
-      summary: "missing on server",
-      message: "no room-key backup exists on the homeserver",
-    };
-  }
-  if (backup.decryptionKeyCached === false) {
-    if (backup.keyLoadError) {
-      return {
-        code: "key-load-failed",
-        summary: "present but backup key unavailable on this device",
-        message: `backup decryption key could not be loaded from secret storage (${backup.keyLoadError})`,
-      };
-    }
-    if (backup.keyLoadAttempted) {
-      return {
-        code: "key-not-loaded",
-        summary: "present but backup key unavailable on this device",
-        message:
-          "backup decryption key is not loaded on this device (secret storage did not return a key)",
-      };
-    }
-    return {
-      code: "key-not-loaded",
-      summary: "present but backup key unavailable on this device",
-      message: "backup decryption key is not loaded on this device",
-    };
-  }
-  if (backup.matchesDecryptionKey === false) {
-    return {
-      code: "key-mismatch",
-      summary: "present but backup key mismatch on this device",
-      message: "backup key mismatch (this device does not have the matching backup decryption key)",
-    };
-  }
-  if (backup.trusted === false) {
-    return {
-      code: "untrusted-signature",
-      summary: "present but not trusted on this device",
-      message: "backup signature chain is not trusted by this device",
-    };
-  }
-  if (!backup.activeVersion) {
-    return {
-      code: "inactive",
-      summary: "present on server but inactive on this device",
-      message: "backup exists but is not active on this device",
-    };
-  }
-  if (
-    backup.trusted === null ||
-    backup.matchesDecryptionKey === null ||
-    backup.decryptionKeyCached === null
-  ) {
-    return {
-      code: "indeterminate",
-      summary: "present but trust state unknown",
-      message: "backup trust state could not be fully determined",
-    };
-  }
-  return {
-    code: "ok",
-    summary: "active and trusted on this device",
-    message: null,
-  };
-}
-
 function printBackupSummary(backup: MatrixCliBackupStatus): void {
-  const issue = resolveBackupIssue(backup);
+  const issue = resolveMatrixRoomKeyBackupIssue(backup);
   console.log(`Backup: ${issue.summary}`);
   if (backup.serverVersion) {
     console.log(`Backup version: ${backup.serverVersion}`);
@@ -556,7 +472,7 @@ function buildVerificationGuidance(
   accountId?: string,
 ): string[] {
   const backup = resolveBackupStatus(status);
-  const backupIssue = resolveBackupIssue(backup);
+  const backupIssue = resolveMatrixRoomKeyBackupIssue(backup);
   const nextSteps = new Set<string>();
   if (!status.verified) {
     nextSteps.add(
@@ -590,7 +506,7 @@ function buildVerificationGuidance(
     );
   } else if (backupIssue.code === "untrusted-signature") {
     nextSteps.add(
-      `Backup trust chain is not verified on this device. Re-run '${formatMatrixCliCommand("verify device <key>", accountId)}'.`,
+      `Backup trust chain is not verified on this device. Re-run '${formatMatrixCliCommand("verify device <key>", accountId)}' if you have the correct recovery key.`,
     );
     nextSteps.add(
       `If you want a fresh backup baseline and accept losing unrecoverable history, run '${formatMatrixCliCommand("verify backup reset --yes", accountId)}'.`,
@@ -623,7 +539,7 @@ function printVerificationStatus(
 ): void {
   console.log(`Verified by owner: ${status.verified ? "yes" : "no"}`);
   const backup = resolveBackupStatus(status);
-  const backupIssue = resolveBackupIssue(backup);
+  const backupIssue = resolveMatrixRoomKeyBackupIssue(backup);
   printVerificationBackupSummary(status);
   if (backupIssue.message) {
     console.log(`Backup issue: ${backupIssue.message}`);

@@ -299,4 +299,85 @@ describe("MatrixRecoveryKeyStore", () => {
       ),
     ).toBe(true);
   });
+
+  it("stages a recovery key for secret storage without persisting it until commit", async () => {
+    const recoveryKeyPath = createTempRecoveryKeyPath();
+    fs.rmSync(recoveryKeyPath, { force: true });
+    const store = new MatrixRecoveryKeyStore(recoveryKeyPath);
+    const encoded = encodeRecoveryKey(
+      new Uint8Array(Array.from({ length: 32 }, (_, i) => (i + 11) % 255)),
+    );
+    expect(encoded).toBeTypeOf("string");
+
+    store.stageEncodedRecoveryKey({
+      encodedPrivateKey: encoded as string,
+      keyId: "SSSSKEY",
+    });
+
+    expect(fs.existsSync(recoveryKeyPath)).toBe(false);
+    const callbacks = store.buildCryptoCallbacks();
+    const resolved = await callbacks.getSecretStorageKey?.(
+      { keys: { SSSSKEY: { name: "test" } } },
+      "m.cross_signing.master",
+    );
+    expect(resolved?.[0]).toBe("SSSSKEY");
+
+    store.commitStagedRecoveryKey({ keyId: "SSSSKEY" });
+
+    const persisted = JSON.parse(fs.readFileSync(recoveryKeyPath, "utf8")) as {
+      keyId?: string;
+      encodedPrivateKey?: string;
+    };
+    expect(persisted.keyId).toBe("SSSSKEY");
+    expect(persisted.encodedPrivateKey).toBe(encoded);
+  });
+
+  it("does not overwrite the stored recovery key while a staged key is only being validated", async () => {
+    const recoveryKeyPath = createTempRecoveryKeyPath();
+    const storedEncoded = encodeRecoveryKey(
+      new Uint8Array(Array.from({ length: 32 }, (_, i) => (i + 1) % 255)),
+    );
+    fs.writeFileSync(
+      recoveryKeyPath,
+      JSON.stringify({
+        version: 1,
+        createdAt: "2026-03-12T00:00:00.000Z",
+        keyId: "OLD",
+        encodedPrivateKey: storedEncoded,
+        privateKeyBase64: Buffer.from(
+          new Uint8Array(Array.from({ length: 32 }, (_, i) => (i + 1) % 255)),
+        ).toString("base64"),
+      }),
+      "utf8",
+    );
+
+    const store = new MatrixRecoveryKeyStore(recoveryKeyPath);
+    const stagedEncoded = encodeRecoveryKey(
+      new Uint8Array(Array.from({ length: 32 }, (_, i) => (i + 101) % 255)),
+    );
+    store.stageEncodedRecoveryKey({
+      encodedPrivateKey: stagedEncoded as string,
+      keyId: "NEW",
+    });
+
+    const crypto = {
+      on: vi.fn(),
+      bootstrapCrossSigning: vi.fn(async () => {}),
+      bootstrapSecretStorage: vi.fn(async () => {}),
+      createRecoveryKeyFromPassphrase: vi.fn(async () => {
+        throw new Error("should not be called");
+      }),
+      getSecretStorageStatus: vi.fn(async () => ({ ready: true, defaultKeyId: "NEW" })),
+      requestOwnUserVerification: vi.fn(async () => null),
+    } as unknown as MatrixCryptoBootstrapApi;
+
+    await store.bootstrapSecretStorageWithRecoveryKey(crypto);
+
+    const persisted = JSON.parse(fs.readFileSync(recoveryKeyPath, "utf8")) as {
+      keyId?: string;
+      encodedPrivateKey?: string;
+    };
+    expect(persisted.keyId).toBe("OLD");
+    expect(persisted.encodedPrivateKey).toBe(storedEncoded);
+  });
 });

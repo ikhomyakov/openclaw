@@ -32,6 +32,8 @@ export class MatrixRecoveryKeyStore {
     string,
     { key: Uint8Array; keyInfo?: MatrixStoredRecoveryKey["keyInfo"] }
   >();
+  private stagedRecoveryKey: MatrixStoredRecoveryKey | null = null;
+  private readonly stagedCacheKeyIds = new Set<string>();
 
   constructor(private readonly recoveryKeyPath?: string) {}
 
@@ -50,8 +52,24 @@ export class MatrixRecoveryKeyStore {
           }
         }
 
+        const staged = this.stagedRecoveryKey;
+        if (staged?.privateKeyBase64) {
+          const privateKey = new Uint8Array(Buffer.from(staged.privateKeyBase64, "base64"));
+          if (privateKey.length > 0) {
+            const stagedKeyId =
+              staged.keyId && requestedKeyIds.includes(staged.keyId)
+                ? staged.keyId
+                : requestedKeyIds[0];
+            if (stagedKeyId) {
+              this.rememberSecretStorageKey(stagedKeyId, privateKey, staged.keyInfo);
+              this.stagedCacheKeyIds.add(stagedKeyId);
+              return [stagedKeyId, privateKey];
+            }
+          }
+        }
+
         const stored = this.loadStoredRecoveryKey();
-        if (!stored || !stored.privateKeyBase64) {
+        if (!stored?.privateKeyBase64) {
           return null;
         }
         const privateKey = new Uint8Array(Buffer.from(stored.privateKeyBase64, "base64"));
@@ -143,6 +161,69 @@ export class MatrixRecoveryKeyStore {
     return this.getRecoveryKeySummary() ?? {};
   }
 
+  stageEncodedRecoveryKey(params: {
+    encodedPrivateKey: string;
+    keyId?: string | null;
+    keyInfo?: MatrixStoredRecoveryKey["keyInfo"];
+  }): void {
+    const encodedPrivateKey = params.encodedPrivateKey.trim();
+    if (!encodedPrivateKey) {
+      throw new Error("Matrix recovery key is required");
+    }
+    let privateKey: Uint8Array;
+    try {
+      privateKey = decodeRecoveryKey(encodedPrivateKey);
+    } catch (err) {
+      throw new Error(
+        `Invalid Matrix recovery key: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    const normalizedKeyId =
+      typeof params.keyId === "string" && params.keyId.trim() ? params.keyId.trim() : null;
+    this.discardStagedRecoveryKey();
+    this.stagedRecoveryKey = {
+      version: 1,
+      createdAt: new Date().toISOString(),
+      keyId: normalizedKeyId,
+      encodedPrivateKey,
+      privateKeyBase64: Buffer.from(privateKey).toString("base64"),
+      keyInfo: params.keyInfo ?? this.loadStoredRecoveryKey()?.keyInfo,
+    };
+  }
+
+  commitStagedRecoveryKey(params?: {
+    keyId?: string | null;
+    keyInfo?: MatrixStoredRecoveryKey["keyInfo"];
+  }): {
+    encodedPrivateKey?: string;
+    keyId?: string | null;
+    createdAt?: string;
+  } | null {
+    if (!this.stagedRecoveryKey) {
+      return this.getRecoveryKeySummary();
+    }
+    const staged = this.stagedRecoveryKey;
+    const privateKey = new Uint8Array(Buffer.from(staged.privateKeyBase64, "base64"));
+    const keyId =
+      typeof params?.keyId === "string" && params.keyId.trim() ? params.keyId.trim() : staged.keyId;
+    this.saveRecoveryKeyToDisk({
+      keyId,
+      keyInfo: params?.keyInfo ?? staged.keyInfo,
+      privateKey,
+      encodedPrivateKey: staged.encodedPrivateKey,
+    });
+    this.clearStagedRecoveryKeyTracking();
+    return this.getRecoveryKeySummary();
+  }
+
+  discardStagedRecoveryKey(): void {
+    for (const keyId of this.stagedCacheKeyIds) {
+      this.secretStorageKeyCache.delete(keyId);
+    }
+    this.clearStagedRecoveryKeyTracking();
+  }
+
   async bootstrapSecretStorageWithRecoveryKey(
     crypto: MatrixCryptoBootstrapApi,
     options: {
@@ -167,18 +248,20 @@ export class MatrixRecoveryKeyStore {
     );
     let generatedRecoveryKey = false;
     const storedRecovery = this.loadStoredRecoveryKey();
-    let recoveryKey: MatrixGeneratedSecretStorageKey | null = storedRecovery
+    const stagedRecovery = this.stagedRecoveryKey;
+    const sourceRecovery = stagedRecovery ?? storedRecovery;
+    let recoveryKey: MatrixGeneratedSecretStorageKey | null = sourceRecovery
       ? {
-          keyInfo: storedRecovery.keyInfo,
-          privateKey: new Uint8Array(Buffer.from(storedRecovery.privateKeyBase64, "base64")),
-          encodedPrivateKey: storedRecovery.encodedPrivateKey,
+          keyInfo: sourceRecovery.keyInfo,
+          privateKey: new Uint8Array(Buffer.from(sourceRecovery.privateKeyBase64, "base64")),
+          encodedPrivateKey: sourceRecovery.encodedPrivateKey,
         }
       : null;
 
     if (recoveryKey && status?.defaultKeyId) {
       const defaultKeyId = status.defaultKeyId;
       this.rememberSecretStorageKey(defaultKeyId, recoveryKey.privateKey, recoveryKey.keyInfo);
-      if (storedRecovery?.keyId !== defaultKeyId) {
+      if (!stagedRecovery && storedRecovery && storedRecovery.keyId !== defaultKeyId) {
         this.saveRecoveryKeyToDisk({
           keyId: defaultKeyId,
           keyInfo: recoveryKey.keyInfo,
@@ -256,6 +339,11 @@ export class MatrixRecoveryKeyStore {
         `Generated Matrix recovery key and saved it to ${this.recoveryKeyPath}. Keep this file secure.`,
       );
     }
+  }
+
+  private clearStagedRecoveryKeyTracking(): void {
+    this.stagedRecoveryKey = null;
+    this.stagedCacheKeyIds.clear();
   }
 
   private rememberSecretStorageKey(
